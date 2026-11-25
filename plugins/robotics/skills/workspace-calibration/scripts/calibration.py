@@ -377,3 +377,173 @@ def jacobian_step_xy(
   if norm > float(max_step_m) > 0.0:
     dxy = dxy * (float(max_step_m) / norm)
   return dxy
+
+
+def _rot_angle_rad(r_mat: np.ndarray) -> float:
+  """Returns the rotation angle of a 3x3 rotation matrix in radians."""
+  cos_a = (float(np.trace(r_mat)) - 1.0) / 2.0
+  return math.acos(min(1.0, max(-1.0, cos_a)))
+
+
+def _invert_se3(t_mat: np.ndarray) -> np.ndarray:
+  r_mat, t_vec = t_mat[:3, :3], t_mat[:3, 3]
+  out = np.eye(4, dtype=np.float64)
+  out[:3, :3] = r_mat.T
+  out[:3, 3] = -r_mat.T @ t_vec
+  return out
+
+
+def solve_fixed_camera_extrinsic_pnp(
+    points_world: Sequence[Sequence[float]] | np.ndarray,
+    pixels_uv: Sequence[Sequence[float]] | np.ndarray,
+    k_mat: Sequence[Sequence[float]] | np.ndarray,
+    dist_coeffs: Sequence[float] | np.ndarray | None = None,
+    *,
+    max_reproj_rms_px: float = 3.0,
+    min_points: int = 6,
+) -> dict[str, Any]:
+  """Solves a fixed camera's `T_world_cam` from 3D points seen as pixels.
+
+  Use when a point on the robot (a gripper-tip marker or colored blob) is
+  detected in the fixed camera while its 3D position in the robot base frame
+  is known from forward kinematics (include any tool offset). Collect points
+  at varied heights and across the workspace (at least 6 points).
+
+  Args:
+    points_world: `(N, 3)` marker positions in the robot base frame (meters).
+    pixels_uv: `(N, 2)` matching detections `(u, v)` in the camera image.
+    k_mat: 3x3 camera intrinsics for the image the pixels came from.
+    dist_coeffs: Optional OpenCV distortion coefficients.
+    max_reproj_rms_px: `valid` requires inlier reprojection RMS at or below it.
+    min_points: Minimum number of correspondences.
+
+  Returns:
+    Dict with `T_world_cam` (4x4, OpenCV optical axes, consistent with
+    `verify_wrist_extrinsic_sign` / `_unproject_pixel_to_plane`),
+    `reproj_rms_px`, `n_inliers`, `n_points`, and `valid`.
+  """
+  pts = np.asarray(points_world, dtype=np.float64).reshape(-1, 3)
+  uv = np.asarray(pixels_uv, dtype=np.float64).reshape(-1, 2)
+  k = np.asarray(k_mat, dtype=np.float64).reshape(3, 3)
+  dist = (
+      np.zeros(5, dtype=np.float64)
+      if dist_coeffs is None
+      else np.asarray(dist_coeffs, dtype=np.float64).ravel()
+  )
+  if pts.shape[0] != uv.shape[0]:
+    raise ValueError("points_world and pixels_uv must have the same length.")
+  if pts.shape[0] < int(min_points):
+    raise ValueError(f"Need at least {min_points} correspondences.")
+
+  ok, rvec, tvec, inliers = cv2.solvePnPRansac(
+      pts,
+      uv,
+      k,
+      dist,
+      flags=cv2.SOLVEPNP_ITERATIVE,
+      reprojectionError=max(2.0 * float(max_reproj_rms_px), 4.0),
+  )
+  if not ok or inliers is None or len(inliers) < int(min_points):
+    raise RuntimeError("PnP failed: too few consistent correspondences.")
+  idx = inliers.ravel()
+  rvec, tvec = cv2.solvePnPRefineLM(pts[idx], uv[idx], k, dist, rvec, tvec)
+  proj, _ = cv2.projectPoints(pts[idx], rvec, tvec, k, dist)
+  rms = float(
+      np.sqrt(np.mean(np.sum((proj.reshape(-1, 2) - uv[idx]) ** 2, axis=1)))
+  )
+
+  t_cam_world = np.eye(4, dtype=np.float64)
+  t_cam_world[:3, :3], _ = cv2.Rodrigues(rvec)
+  t_cam_world[:3, 3] = tvec.ravel()
+  return {
+      "T_world_cam": _invert_se3(t_cam_world),
+      "reproj_rms_px": rms,
+      "n_inliers": int(idx.size),
+      "n_points": int(pts.shape[0]),
+      "valid": bool(rms <= float(max_reproj_rms_px)),
+  }
+
+
+def solve_fixed_camera_extrinsic_handeye(
+    t_world_ee_list: Sequence[Sequence[Sequence[float]] | np.ndarray],
+    t_cam_target_list: Sequence[Sequence[Sequence[float]] | np.ndarray],
+    *,
+    method: int = cv2.CALIB_HAND_EYE_TSAI,
+    max_trans_err_m: float = 0.01,
+    max_rot_err_deg: float = 2.0,
+    min_poses: int = 5,
+) -> dict[str, Any]:
+  """Solves a fixed camera's `T_world_cam` (eye-to-hand) from a held target.
+
+  A calibration target (ChArUco/AprilTag board) is rigidly attached to the end
+  effector. For each robot pose `i`, give the end-effector pose in the robot
+  base frame `T_world_ee[i]` (from forward kinematics) and the target pose in
+  the camera frame `T_cam_target[i]` (from `cv2.solvePnP` / marker detection).
+  Poses must include varied orientations about at least two non-parallel axes.
+
+  Internally uses `cv2.calibrateHandEye` with the eye-to-hand convention
+  (inverted gripper poses), then reports how well `T_ee_target` stays constant.
+
+  Args:
+    t_world_ee_list: Sequence of 4x4 end-effector poses in the base frame.
+    t_cam_target_list: Sequence of 4x4 target poses in the camera frame.
+    method: OpenCV hand-eye method (default Tsai; Park/Daniilidis also work).
+    max_trans_err_m: `valid` requires translation spread at or below it.
+    max_rot_err_deg: `valid` requires rotation spread at or below it.
+    min_poses: Minimum number of pose pairs.
+
+  Returns:
+    Dict with `T_world_cam` (4x4, OpenCV optical axes), `T_ee_target`,
+    `trans_err_m` (RMS spread of `T_ee_target` translations),
+    `rot_err_deg` (max rotation deviation from the mean), `n_poses`, `valid`.
+  """
+  if len(t_world_ee_list) != len(t_cam_target_list):
+    raise ValueError("Pose lists must have the same length.")
+  n = len(t_world_ee_list)
+  if n < int(min_poses):
+    raise ValueError(f"Need at least {min_poses} pose pairs.")
+  t_we = [np.asarray(t, dtype=np.float64).reshape(4, 4) for t in t_world_ee_list]
+  t_ct = [np.asarray(t, dtype=np.float64).reshape(4, 4) for t in t_cam_target_list]
+
+  # Eye-to-hand: feed base->gripper (inverse of the usual gripper->base); the
+  # "cam2gripper" output is then cam->base, i.e. `T_world_cam`.
+  t_ew = [_invert_se3(t) for t in t_we]
+  r_out, t_out = cv2.calibrateHandEye(
+      [t[:3, :3] for t in t_ew],
+      [t[:3, 3].reshape(3, 1) for t in t_ew],
+      [t[:3, :3] for t in t_ct],
+      [t[:3, 3].reshape(3, 1) for t in t_ct],
+      method=method,
+  )
+  t_world_cam = np.eye(4, dtype=np.float64)
+  t_world_cam[:3, :3] = r_out
+  t_world_cam[:3, 3] = t_out.ravel()
+
+  # T_ee_target must be constant across poses if the solution is right.
+  t_et = [_invert_se3(a) @ t_world_cam @ b for a, b in zip(t_we, t_ct)]
+  trans = np.stack([t[:3, 3] for t in t_et])
+  mean_t = trans.mean(axis=0)
+  trans_err = float(np.sqrt(np.mean(np.sum((trans - mean_t) ** 2, axis=1))))
+  # Mean rotation via SVD projection of the averaged matrices.
+  u, _, vt = np.linalg.svd(np.mean([t[:3, :3] for t in t_et], axis=0))
+  r_mean = u @ vt
+  if np.linalg.det(r_mean) < 0.0:
+    u[:, -1] *= -1.0
+    r_mean = u @ vt
+  rot_err = max(
+      math.degrees(_rot_angle_rad(r_mean.T @ t[:3, :3])) for t in t_et
+  )
+  t_ee_target = np.eye(4, dtype=np.float64)
+  t_ee_target[:3, :3] = r_mean
+  t_ee_target[:3, 3] = mean_t
+  return {
+      "T_world_cam": t_world_cam,
+      "T_ee_target": t_ee_target,
+      "trans_err_m": trans_err,
+      "rot_err_deg": float(rot_err),
+      "n_poses": n,
+      "valid": bool(
+          trans_err <= float(max_trans_err_m)
+          and rot_err <= float(max_rot_err_deg)
+      ),
+  }

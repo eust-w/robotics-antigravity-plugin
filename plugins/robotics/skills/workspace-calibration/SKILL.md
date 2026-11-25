@@ -42,6 +42,13 @@ clean target Z.
      then step with `jacobian_step_xy(J_xy_uv, uv_target, uv_ref)`.
    - Record `closing_axis_ee`, `open_cmd`, `closed_cmd`, and
      `gripper_empty_closed` once in `.robot_calibration.json`.
+   - *Fixed camera `T_world_cam` (eye-to-hand)*: with a gripper-tip marker at
+     known FK positions, call `solve_fixed_camera_extrinsic_pnp(points_world,
+     pixels_uv, K)`; with a calibration target held in the gripper, call
+     `solve_fixed_camera_extrinsic_handeye(t_world_ee_list,
+     t_cam_target_list)` using varied end-effector orientations. Both return
+     `T_world_cam` (OpenCV optical axes) plus residuals and `valid`; persist it
+     only when `valid` is true. Verify with `python3 scripts/calibration_test.py`.
    - Use fixed-camera `fit_plane_homography` only as a cached coarse seed for a
      wrist camera (or fallback when no wrist camera, depth, or `T_world_cam`
      exists).
