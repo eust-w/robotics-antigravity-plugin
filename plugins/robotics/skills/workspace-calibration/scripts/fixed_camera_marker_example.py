@@ -163,6 +163,58 @@ def offset_sensitivity(
   return out
 
 
+def tool_tilt_deg(t_world_frame: np.ndarray) -> float:
+  """Angle (deg) between the tool +z axis and straight down (base -Z)."""
+  z_axis = np.asarray(t_world_frame, dtype=np.float64).reshape(4, 4)[:3, 2]
+  cos_a = float(np.clip(z_axis @ np.array([0.0, 0.0, -1.0]), -1.0, 1.0))
+  return float(np.degrees(np.arccos(cos_a)))
+
+
+def residual_report(
+    poses: list[np.ndarray],
+    pixels_uv: list[tuple[float, float]],
+    res: dict[str, Any],
+    *,
+    tilt_bins_deg: tuple[float, ...] = (10.0, 25.0),
+) -> dict[str, Any]:
+  """Per-pose signed residuals (detected - re-projected) grouped by tilt.
+
+  Tilted poses carry most of the sensitivity to the principal point and to the
+  marker offset, so a systematic bias in `dv` (or `du`) that appears in one
+  tilt group hints at a wrong `cy` (or `cx`) or a wrong offset. The tool +z
+  axis is assumed to point down at zero tilt; adjust if your frame differs.
+  """
+  uv = np.asarray(pixels_uv, dtype=np.float64)
+  signed = uv - res["reprojected_uv"]
+  tilts = np.array([tool_tilt_deg(t) for t in poses])
+  edges = (0.0,) + tuple(tilt_bins_deg) + (180.0,)
+  groups = []
+  for lo, hi in zip(edges[:-1], edges[1:]):
+    sel = (tilts >= lo) & (tilts < hi)
+    if not np.any(sel):
+      continue
+    groups.append({
+        "tilt_range_deg": (lo, hi),
+        "n": int(np.sum(sel)),
+        "mean_du_px": float(np.mean(signed[sel, 0])),
+        "mean_dv_px": float(np.mean(signed[sel, 1])),
+        "rms_px": float(np.sqrt(np.mean(np.sum(signed[sel] ** 2, axis=1)))),
+    })
+  return {
+      "per_pose": [
+          {
+              "index": i,
+              "tilt_deg": float(tilts[i]),
+              "du_px": float(signed[i, 0]),
+              "dv_px": float(signed[i, 1]),
+              "err_px": float(np.linalg.norm(signed[i])),
+          }
+          for i in range(len(poses))
+      ],
+      "groups": groups,
+  }
+
+
 def draw_overlay(
     image_bgr: np.ndarray,
     detected_uv: tuple[float, float],
@@ -248,6 +300,7 @@ def run(
   res["sensitivity_m_per_5mm"] = offset_sensitivity(
       kept_pose, uvs, k_mat, dist, offset_m
   )
+  res["residuals"] = residual_report(kept_pose, uvs, res)
   for i, (img, uv) in enumerate(zip(kept_img, uvs)):
     cv2.imwrite(
         str(out_dir / f"overlay_{i:02d}.png"),
@@ -263,6 +316,20 @@ def _print_report(res: dict[str, Any]) -> None:
   )
   print("per-point error (px):", np.round(res["per_point_err_px"], 2).tolist())
   print("T_world_cam:\n", np.round(res["T_world_cam"], 4))
+  print("per-pose residuals (detected - re-projected):")
+  for r in res["residuals"]["per_pose"]:
+    print(
+        f"  pose {r['index']:2d}  tilt={r['tilt_deg']:5.1f} deg  "
+        f"du={r['du_px']:+6.2f}  dv={r['dv_px']:+6.2f}  err={r['err_px']:5.2f} px"
+    )
+  print("grouped by tool tilt (a consistent dv/du sign hints at cy/cx or offset error):")
+  for g in res["residuals"]["groups"]:
+    lo, hi = g["tilt_range_deg"]
+    print(
+        f"  tilt [{lo:g}, {hi:g}) deg  n={g['n']}  "
+        f"mean du={g['mean_du_px']:+.2f}  mean dv={g['mean_dv_px']:+.2f}  "
+        f"rms={g['rms_px']:.2f} px"
+    )
   s = res["sensitivity_m_per_5mm"]
   print(
       "camera position shift for a 5 mm offset error (m): "

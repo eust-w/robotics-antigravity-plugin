@@ -73,6 +73,28 @@ class MarkerExampleTest(unittest.TestCase):
     sens = ex.offset_sensitivity(poses, uvs, K, DIST, OFFSET)
     self.assertTrue(all(v > 0.0 for v in sens.values()))
 
+  def test_tool_tilt_deg(self):
+    down = np.eye(4)
+    down[:3, :3], _ = cv2.Rodrigues(np.array([np.pi, 0.0, 0.0]))  # +z down.
+    self.assertAlmostEqual(ex.tool_tilt_deg(down), 0.0, places=6)
+    tilted = down.copy()
+    rot_x30, _ = cv2.Rodrigues(np.array([np.radians(30.0), 0.0, 0.0]))
+    tilted[:3, :3] = rot_x30 @ down[:3, :3]
+    self.assertAlmostEqual(ex.tool_tilt_deg(tilted), 30.0, places=4)
+
+  def test_residual_report_groups_and_signs(self):
+    images, poses, _ = ex.make_synthetic_frames(12, K, DIST, OFFSET)
+    uvs = [ex.detect_marker_pixel(i) for i in images]
+    res = ex.calibrate(poses, uvs, K, DIST, OFFSET)
+    rep = ex.residual_report(poses, uvs, res)
+    self.assertEqual(len(rep["per_pose"]), 12)
+    self.assertEqual(sum(g["n"] for g in rep["groups"]), 12)
+    # Signed residual must equal detected - re-projected for every pose.
+    for r in rep["per_pose"]:
+      i = r["index"]
+      self.assertAlmostEqual(r["du_px"], uvs[i][0] - res["reprojected_uv"][i][0])
+      self.assertAlmostEqual(r["dv_px"], uvs[i][1] - res["reprojected_uv"][i][1])
+
 
 if __name__ == "__main__":
   unittest.main()
